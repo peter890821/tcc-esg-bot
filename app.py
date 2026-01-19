@@ -1,4 +1,5 @@
 import io
+import os
 import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -16,6 +17,7 @@ except Exception:  # pragma: no cover
 
 
 DEFAULT_CSV_PATH = "MSCI_Methodology_Full_KB.csv"
+KB_DIRECTORY = "kb"  # 專門放長期知識庫檔案的資料夾
 REQUIRED_COLUMNS = {"text_content", "source_file", "doc_type"}
 
 
@@ -199,50 +201,78 @@ def load_csv_from_path(path: str) -> pd.DataFrame:
 def get_kb_dataframe(uploaded_files) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     """
     Returns (df, error_message). error_message is None when success.
+
+    知識來源優先順序：
+    1. 專案內的 kb/ 資料夾（長期知識庫，啟動時自動載入）
+    2. 使用者在網頁上臨時上傳的檔案
+    3. 專案根目錄下的預設 CSV：MSCI_Methodology_Full_KB.csv
     """
-    # 有上傳檔案：整合所有檔案成一份 DataFrame
+    dfs: List[pd.DataFrame] = []
+
+    # 1) 掃描本地 kb/ 資料夾（遞迴掃描所有子資料夾）
+    if os.path.isdir(KB_DIRECTORY):
+        for root, _, files in os.walk(KB_DIRECTORY):
+            for name in files:
+                lower = name.lower()
+                if not lower.endswith((".csv", ".xlsx", ".pdf", ".docx", ".pptx")):
+                    continue
+                path = os.path.join(root, name)
+                # 保留相對於 kb/ 的完整路徑（包含子資料夾），例如：環境相關/report.pdf
+                rel_path = os.path.relpath(path, KB_DIRECTORY)
+                try:
+                    with open(path, "rb") as f:
+                        file_bytes = f.read()
+                    df_part = load_kb_from_bytes(file_bytes, rel_path)
+                    dfs.append(df_part)
+                except Exception:
+                    # 若單一檔案失敗，不影響整體，可加日後 logging
+                    continue
+
+    # 2) 網頁上臨時上傳的檔案
     if uploaded_files:
         try:
-            dfs: List[pd.DataFrame] = []
             for f in uploaded_files:
                 file_bytes = f.getvalue()
                 df_part = load_kb_from_bytes(file_bytes, f.name)
                 dfs.append(df_part)
-
-            if not dfs:
-                return None, "上傳檔案後無法建立知識庫，請確認檔案內容是否為可讀取的文字或表格。"
-
-            df_all = pd.concat(dfs, ignore_index=True)
-            # 確保存在必要欄位
-            for col in REQUIRED_COLUMNS:
-                if col not in df_all.columns:
-                    df_all[col] = ""
-                df_all[col] = df_all[col].fillna("").astype(str)
-
-            return df_all[list(REQUIRED_COLUMNS)], None
         except Exception as e:
             return None, f"讀取上傳檔案失敗：{e}"
 
-    # 沒有上傳檔案：仍然嘗試讀取預設 CSV
-    try:
-        df = load_csv_from_path(DEFAULT_CSV_PATH)
-    except FileNotFoundError:
-        return None, f"找不到預設知識庫檔案：{DEFAULT_CSV_PATH}。請在側邊欄上傳 CSV、Excel 或文件檔。"
-    except pd.errors.EmptyDataError:
-        return None, "預設 CSV 檔案是空的或格式不正確。"
-    except UnicodeDecodeError:
-        return None, "預設 CSV 編碼讀取失敗。請嘗試另存為 UTF-8 後重新放置。"
-    except Exception as e:
-        return None, f"讀取預設 CSV 失敗：{e}"
+    # 3) 若前兩者都沒有資料，試著載入預設 CSV
+    if not dfs:
+        try:
+            df = load_csv_from_path(DEFAULT_CSV_PATH)
+        except FileNotFoundError:
+            return None, (
+                f"找不到任何知識庫資料。\n"
+                f"- 若要使用預設檔案，請將 {DEFAULT_CSV_PATH} 放在專案根目錄。\n"
+                f"- 或建立 `{KB_DIRECTORY}` 資料夾，放入 CSV/Excel/PDF/Word/PPT 檔案。\n"
+                f"- 或直接在左側上傳 ESG 知識庫檔案。"
+            )
+        except pd.errors.EmptyDataError:
+            return None, "預設 CSV 檔案是空的或格式不正確。"
+        except UnicodeDecodeError:
+            return None, "預設 CSV 編碼讀取失敗。請嘗試另存為 UTF-8 後重新放置。"
+        except Exception as e:
+            return None, f"讀取預設 CSV 失敗：{e}"
 
-    missing = REQUIRED_COLUMNS - set(df.columns)
-    if missing:
-        return None, f"預設 CSV 缺少必要欄位：{', '.join(sorted(missing))}。需要欄位：{', '.join(sorted(REQUIRED_COLUMNS))}"
+        missing = REQUIRED_COLUMNS - set(df.columns)
+        if missing:
+            return None, f"預設 CSV 缺少必要欄位：{', '.join(sorted(missing))}。需要欄位：{', '.join(sorted(REQUIRED_COLUMNS))}"
 
+        for col in REQUIRED_COLUMNS:
+            df[col] = df[col].fillna("").astype(str)
+
+        return df[list(REQUIRED_COLUMNS)], None
+
+    # 合併來自 kb/ 與上傳的所有資料
+    df_all = pd.concat(dfs, ignore_index=True)
     for col in REQUIRED_COLUMNS:
-        df[col] = df[col].fillna("").astype(str)
+        if col not in df_all.columns:
+            df_all[col] = ""
+        df_all[col] = df_all[col].fillna("").astype(str)
 
-    return df[list(REQUIRED_COLUMNS)], None
+    return df_all[list(REQUIRED_COLUMNS)], None
 
 
 def build_prompt(context: str, question: str) -> str:
